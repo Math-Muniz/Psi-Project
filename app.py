@@ -1,7 +1,6 @@
 import os
 import streamlit as st
 import streamlit.components.v1 as components
-import random
 import uuid
 import logging
 import secrets
@@ -25,7 +24,6 @@ load_dotenv()
 END_SESSION_CODE = "H7Y4K9P2R1T6X3Z0V8B5N7M3G"
 EVALUATION_METADATA_KEY = "is_evaluation"
 MIN_PROMPT_LENGTH = 10
-CLEANUP_DAYS = 30
 BRAZIL_TZ = timezone(timedelta(hours=-3))
 CLOCK_HTML = """<style> .digital-clock { background-color: #e1e5eb; border: 2px solid #c9ced4; border-radius: 5px; padding: 8px; font-family: sans-serif; color: #0d1a33; font-size: 1.75rem; font-weight: bold; text-align: center; letter-spacing: 2px; } </style><script> function updateClock() { var now = new Date(); var h = now.getHours().toString().padStart(2, '0'); var m = now.getMinutes().toString().padStart(2, '0'); var s = now.getSeconds().toString().padStart(2, '0'); document.getElementById('clock').innerText = h + ':' + m + ':' + s; } setInterval(updateClock, 1000); setTimeout(updateClock, 1); </script><div id="clock" class="digital-clock"></div>"""
 
@@ -47,10 +45,11 @@ if not api_key or not model:
     st.stop()
 
 # --- 3. ESTRUTURAS DE DADOS E DEFINIÇÕES GLOBAIS ---
+# ORDEM FIXA: Clara → Rafael → Luiz
 PERSONAS_DATA = [
-    {"name": "Rafael", "prompt": PERSONA_RAFAEL},
-    {"name": "Clara", "prompt": PERSONA_CLARA},
-    {"name": "Luiz", "prompt": PERSONA_LUIZ},
+    {"name": "Clara", "prompt": PERSONA_CLARA, "order": 1},
+    {"name": "Rafael", "prompt": PERSONA_RAFAEL, "order": 2},
+    {"name": "Luiz", "prompt": PERSONA_LUIZ, "order": 3},
 ]
 
 class AgentState(TypedDict):
@@ -82,6 +81,25 @@ def route_entry_point(state: AgentState) -> str:
         if current_session == 1: return "evaluate_session_1"
         elif current_session == 2: return "evaluate_session_2"
     return "patient_node"
+
+def get_next_persona(current_persona_name: str) -> Dict:
+    """Retorna o próximo paciente na ordem fixa: Clara → Rafael → Luiz → Clara..."""
+    current_persona = next((p for p in PERSONAS_DATA if p["name"] == current_persona_name), None)
+    
+    if not current_persona:
+        # Se não encontrar, retorna Clara (primeira da lista)
+        return PERSONAS_DATA[0]
+    
+    current_order = current_persona["order"]
+    
+    # Busca o próximo na ordem
+    next_persona = next((p for p in PERSONAS_DATA if p["order"] == current_order + 1), None)
+    
+    # Se não houver próximo, volta para o primeiro (Clara)
+    if not next_persona:
+        next_persona = PERSONAS_DATA[0]
+    
+    return next_persona
 
 # --- 5. FUNÇÕES CACHEADAS PARA RECURSOS CAROS (DB, LLMs e Grafo) ---
 
@@ -269,33 +287,6 @@ def show_unauthorized_page():
 
 # --- 7. FUNÇÕES DE GERENCIAMENTO DE SESSÃO ---
 
-def cleanup_old_sessions(days: int = CLEANUP_DAYS):
-    """Remove sessões mais antigas que X dias DO USUÁRIO ATUAL."""
-    try:
-        user_id = st.session_state.user_id
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
-        
-        with db_connection.cursor() as cur:
-            cur.execute("""
-                DELETE FROM session_metadata 
-                WHERE user_id = %s AND last_accessed < %s
-                RETURNING thread_id
-            """, (user_id, cutoff_date))
-            
-            deleted_threads = cur.fetchall()
-            deleted_count = len(deleted_threads)
-            
-            db_connection.commit()
-            
-            if deleted_count > 0:
-                logger.info(f"🧹 Removidas {deleted_count} sessões antigas do usuário {user_id}")
-            
-            return deleted_count
-    except Exception as e:
-        logger.error(f"Erro ao limpar sessões antigas: {e}")
-        db_connection.rollback()
-        return 0
-
 def update_session_access_time(thread_id: str):
     """Atualiza o timestamp de último acesso da sessão."""
     try:
@@ -310,7 +301,7 @@ def update_session_access_time(thread_id: str):
         logger.error(f"Erro ao atualizar tempo de acesso: {e}")
         db_connection.rollback()
 
-def get_recent_sessions(limit: int = 10):
+def get_recent_sessions(limit: int = 50):
     """Retorna as sessões mais recentes DO USUÁRIO ATUAL, ordenadas pela data de criação."""
     try:
         user_id = st.session_state.user_id
@@ -441,10 +432,21 @@ def initialize_session(thread_id: str = None, force_new: bool = False):
         if load_session_from_checkpoint(thread_id):
             return
     
-    # Criar nova sessão
+    # Criar nova sessão - seleciona próximo paciente na ordem
     logger.info("Criando uma nova sessão.")
     new_thread_id = str(uuid.uuid4())
-    new_patient = random.choice(PERSONAS_DATA)
+    
+    # Busca a última sessão do usuário para determinar o próximo paciente
+    recent_sessions = get_recent_sessions(limit=1)
+    
+    if recent_sessions and len(recent_sessions) > 0:
+        last_persona_name = recent_sessions[0][1]  # Nome da persona da última sessão
+        new_patient = get_next_persona(last_persona_name)
+        logger.info(f"Última sessão foi com {last_persona_name}, próximo será {new_patient['name']}")
+    else:
+        # Se for a primeira sessão, começa com Clara
+        new_patient = PERSONAS_DATA[0]
+        logger.info(f"Primeira sessão do usuário, começando com {new_patient['name']}")
     
     # Salvar metadados da sessão
     save_session_metadata(new_thread_id, new_patient['name'])
@@ -460,7 +462,7 @@ def initialize_session(thread_id: str = None, force_new: bool = False):
     # Atualiza a query string
     st.query_params.thread_id = new_thread_id
     logger.info(f"✅ Nova sessão inicializada: {new_thread_id} com a persona {new_patient['name']}")
-    st.toast("✅ Simulação iniciada! Um novo paciente foi selecionado!")
+    st.toast(f"✅ Novo paciente: {new_patient['name']}!")
 
 # --- 8. VALIDAÇÃO DE ACESSO E INICIALIZAÇÃO ---
 
@@ -472,13 +474,6 @@ if not is_user_authorized(st.session_state.user_id):
 
 # Se chegou aqui, usuário está autorizado - continuar normalmente
 logger.info(f"✅ Usuário autorizado: {st.session_state.user_id}")
-
-# Cleanup automático (executado uma vez por sessão)
-if "cleanup_done" not in st.session_state:
-    deleted_count = cleanup_old_sessions()
-    st.session_state.cleanup_done = True
-    if deleted_count > 0:
-        logger.info(f"Cleanup inicial: {deleted_count} sessões antigas removidas")
 
 # --- Lógica de Inicialização da Sessão ---
 # Verifica se há um thread_id diferente na URL
@@ -512,7 +507,7 @@ with st.sidebar:
         st.caption(f"📅 Sessão iniciada: {datetime.now(BRAZIL_TZ).strftime('%H:%M')}")
         
     st.header("Suas Conversas")
-    recent_sessions = get_recent_sessions(limit=10)
+    recent_sessions = get_recent_sessions(limit=50)
 
     if recent_sessions:
         current_tid = st.session_state.get("thread_id")
@@ -532,7 +527,11 @@ with st.sidebar:
             else:
                 time_str = f"Último acesso {time_diff.seconds // 60}min atrás"
             
-            button_label = f"{'🟢' if is_current else '⚪'} {persona}"
+            # Formata a data de criação
+            created_at_local = created_at.astimezone(BRAZIL_TZ)
+            date_str = created_at_local.strftime('%d/%m %H:%M')
+            
+            button_label = f"{'🟢' if is_current else '⚪'} {persona} - {date_str}"
 
             if st.button(
                 button_label,
@@ -557,7 +556,7 @@ with st.sidebar:
     st.header("Controles")
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🔄 Reiniciar", use_container_width=True):
+        if st.button("🔄 Novo Paciente", use_container_width=True):
             initialize_session(force_new=True)
             st.rerun()
     with col2:
@@ -620,7 +619,7 @@ for i, msg in enumerate(st.session_state.messages):
         st.divider(); st.subheader("🔄 Sessão 2"); st.divider()
     if st.session_state.session_2_end_index > 0 and i == st.session_state.session_2_end_index - 1:
         st.divider(); st.subheader("✅ Fim da Simulação"); st.divider()
-        st.info("💡 Use o botão 'Download' para salvar o histórico ou 'Reiniciar'.", icon="ℹ️")
+        st.info("💡 Use o botão 'Download' para salvar o histórico ou 'Novo Paciente' para continuar.", icon="ℹ️")
 
 # --- Input do Chat e Geração de Resposta ---
 if prompt := st.chat_input("Digite sua mensagem...", disabled=(st.session_state.current_session_num > 2)):
