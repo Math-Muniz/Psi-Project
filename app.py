@@ -103,18 +103,40 @@ def get_next_persona(current_persona_name: str) -> Dict:
 
 # --- 5. FUNÇÕES CACHEADAS PARA RECURSOS CAROS (DB, LLMs e Grafo) ---
 
+def create_db_connection():
+    """Cria uma nova conexão com o banco de dados."""
+    return psycopg.connect(
+        host=os.getenv("POSTGRES_HOST"),
+        port=os.getenv("POSTGRES_PORT"),
+        user=os.getenv("POSTGRES_USER"),
+        password=os.getenv("POSTGRES_PASSWORD"),
+        dbname=os.getenv("POSTGRES_DB"),
+        sslmode='require'
+    )
+
+def ensure_db_connection():
+    """Garante que a conexão com o banco está ativa, reconectando se necessário."""
+    global db_connection
+    try:
+        # Testa a conexão com uma query simples
+        with db_connection.cursor() as cur:
+            cur.execute("SELECT 1")
+            db_connection.commit()
+    except Exception as e:
+        logger.warning(f"Conexão perdida, reconectando... ({e})")
+        try:
+            db_connection.close()
+        except:
+            pass
+        db_connection = create_db_connection()
+        logger.info("✅ Reconexão bem-sucedida")
+    return db_connection
+
 @st.cache_resource
 def get_db_connection():
     logger.info("Criando conexão com o banco de dados (executado apenas uma vez)...")
     try:
-        conn = psycopg.connect(
-            host=os.getenv("POSTGRES_HOST"),
-            port=os.getenv("POSTGRES_PORT"),
-            user=os.getenv("POSTGRES_USER"),
-            password=os.getenv("POSTGRES_PASSWORD"),
-            dbname=os.getenv("POSTGRES_DB"),
-            sslmode='require'
-        )
+        conn = create_db_connection()
         
         # Criar/Atualizar tabela para metadados de sessão
         with conn.cursor() as cur:
@@ -290,23 +312,28 @@ def show_unauthorized_page():
 def update_session_access_time(thread_id: str):
     """Atualiza o timestamp de último acesso da sessão."""
     try:
-        with db_connection.cursor() as cur:
+        conn = ensure_db_connection()
+        with conn.cursor() as cur:
             cur.execute("""
                 UPDATE session_metadata 
                 SET last_accessed = CURRENT_TIMESTAMP 
                 WHERE thread_id = %s
             """, (thread_id,))
-            db_connection.commit()
+            conn.commit()
     except Exception as e:
         logger.error(f"Erro ao atualizar tempo de acesso: {e}")
-        db_connection.rollback()
+        try:
+            conn.rollback()
+        except:
+            pass
 
-def get_recent_sessions(limit: int = 50):
+def get_recent_sessions(limit: int = 10):
     """Retorna as sessões mais recentes DO USUÁRIO ATUAL, ordenadas pela data de criação."""
     try:
         user_id = st.session_state.user_id
+        conn = ensure_db_connection()
         
-        with db_connection.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT thread_id, persona_name, created_at, last_accessed 
                 FROM session_metadata 
@@ -315,19 +342,19 @@ def get_recent_sessions(limit: int = 50):
                 LIMIT %s
             """, (user_id, limit))
             results = cur.fetchall()
-            db_connection.commit() 
+            conn.commit() 
             return results
     except Exception as e:
         logger.error(f"Erro ao buscar sessões recentes: {e}")
-        db_connection.rollback() 
         return []
 
 def save_session_metadata(thread_id: str, persona_name: str):
     """Salva os metadados da sessão no banco de dados COM user_id."""
     try:
         user_id = st.session_state.user_id
+        conn = ensure_db_connection()
         
-        with db_connection.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO session_metadata (thread_id, persona_name, user_id, last_accessed)
                 VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
@@ -336,24 +363,28 @@ def save_session_metadata(thread_id: str, persona_name: str):
                     last_accessed = CURRENT_TIMESTAMP,
                     user_id = EXCLUDED.user_id
             """, (thread_id, persona_name, user_id))
-            db_connection.commit()
+            conn.commit()
         logger.info(f"Metadados salvos: {thread_id} -> {persona_name} (user: {user_id})")
     except Exception as e:
         logger.error(f"Erro ao salvar metadados: {e}")
-        db_connection.rollback()
+        try:
+            conn.rollback()
+        except:
+            pass
 
 def load_session_metadata(thread_id: str) -> str:
     """Carrega o nome da persona do banco de dados SE pertencer ao usuário atual."""
     try:
         user_id = st.session_state.user_id
+        conn = ensure_db_connection()
         
-        with db_connection.cursor() as cur:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT persona_name FROM session_metadata 
                 WHERE thread_id = %s AND user_id = %s
             """, (thread_id, user_id))
             result = cur.fetchone()
-            db_connection.commit()
+            conn.commit()
             
             if result:
                 update_session_access_time(thread_id)
@@ -362,7 +393,6 @@ def load_session_metadata(thread_id: str) -> str:
                 logger.warning(f"Tentativa de acessar sessão de outro usuário: {thread_id}")
     except Exception as e:
         logger.error(f"Erro ao carregar metadados: {e}")
-        db_connection.rollback()
     return None
 
 def load_session_from_checkpoint(thread_id: str) -> bool:
