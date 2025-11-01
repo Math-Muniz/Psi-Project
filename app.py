@@ -12,7 +12,18 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 from langgraph.graph import StateGraph, add_messages, END, START
 from langgraph.checkpoint.postgres import PostgresSaver
 import psycopg
-from prompts import PERSONA_RAFAEL, PERSONA_CLARA, PERSONA_LUIZ, EVALUATION_SESSION_1, EVALUATION_SESSION_2
+from prompts import (
+    PERSONA_RAFAEL, 
+    PERSONA_CLARA, 
+    PERSONA_LUIZ, 
+    EVALUATION_SESSION_1, 
+    EVALUATION_SESSION_2,
+    EVALUATION_SESSION_3,
+    EVALUATION_SESSION_4,
+    EVALUATION_SESSION_5,
+    EVALUATION_SESSION_6,
+    EVALUATION_SESSION_7
+)
 
 # --- 1. CONFIGURAÇÃO INICIAL E LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -679,3 +690,4 @@ if st.session_state.messages and isinstance(st.session_state.messages[-1], Human
             except Exception as e:
                 logger.error(f"Error generating patient response: {e}")
                 st.error(f"❌ Erro ao gerar resposta: {str(e)}")
+
