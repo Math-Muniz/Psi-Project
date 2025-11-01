@@ -63,10 +63,21 @@ PERSONAS_DATA = [
     {"name": "Luiz", "prompt": PERSONA_LUIZ, "order": 3},
 ]
 
+# Mapeia número de sessão para prompt de avaliação
+EVALUATION_PROMPTS = {
+    1: EVALUATION_SESSION_1,
+    2: EVALUATION_SESSION_2,
+    3: EVALUATION_SESSION_3,
+    4: EVALUATION_SESSION_4,
+    5: EVALUATION_SESSION_5,
+    6: EVALUATION_SESSION_6,
+    7: EVALUATION_SESSION_7
+}
+
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     current_session: int
-    session_1_end_index: int
+    session_end_indices: Dict[int, int]  # Mapeia sessão -> índice de fim
     patient_prompt: str
     persona_name: str
 
@@ -80,17 +91,51 @@ def is_valid_uuid(val: str) -> bool:
         return False
 
 def filter_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """Remove mensagens de controle e avaliações."""
     return [msg for msg in messages if not (isinstance(msg, HumanMessage) and END_SESSION_CODE in msg.content) and not (isinstance(msg, AIMessage) and msg.response_metadata.get(EVALUATION_METADATA_KEY))]
 
 def create_transcript(messages: List[BaseMessage]) -> str:
+    """Cria transcrição formatada das mensagens."""
     return "\n".join([f"{'Terapeuta' if isinstance(msg, HumanMessage) else 'Paciente'}: {msg.content}" for msg in messages])
 
+def get_session_messages(state: AgentState, session_number: int) -> List[BaseMessage]:
+    """Extrai apenas as mensagens de uma sessão específica."""
+    session_end_indices = state.get("session_end_indices", {})
+    all_messages = state["messages"]
+    
+    # Pega índice de início (fim da sessão anterior + 1)
+    if session_number == 1:
+        start_idx = 0
+    else:
+        start_idx = session_end_indices.get(session_number - 1, 0)
+    
+    # Pega índice de fim (agora, já que estamos avaliando)
+    end_idx = len(all_messages)
+    
+    return all_messages[start_idx:end_idx]
+
 def route_entry_point(state: AgentState) -> str:
+    """Roteia para o nó correto baseado no estado."""
     last_message = state["messages"][-1] if state["messages"] else None
+    
     if isinstance(last_message, HumanMessage) and END_SESSION_CODE in last_message.content:
         current_session = state.get("current_session", 1)
-        if current_session == 1: return "evaluate_session_1"
-        elif current_session == 2: return "evaluate_session_2"
+        
+        if current_session == 1:
+            return "evaluate_session_1"
+        elif current_session == 2:
+            return "evaluate_session_2"
+        elif current_session == 3:
+            return "evaluate_session_3"
+        elif current_session == 4:
+            return "evaluate_session_4"
+        elif current_session == 5:
+            return "evaluate_session_5"
+        elif current_session == 6:
+            return "evaluate_session_6"
+        elif current_session == 7:
+            return "evaluate_session_7"
+    
     return "patient_node"
 
 def get_next_persona(current_persona_name: str) -> Dict:
@@ -98,15 +143,11 @@ def get_next_persona(current_persona_name: str) -> Dict:
     current_persona = next((p for p in PERSONAS_DATA if p["name"] == current_persona_name), None)
     
     if not current_persona:
-        # Se não encontrar, retorna Clara (primeira da lista)
         return PERSONAS_DATA[0]
     
     current_order = current_persona["order"]
-    
-    # Busca o próximo na ordem
     next_persona = next((p for p in PERSONAS_DATA if p["order"] == current_order + 1), None)
     
-    # Se não houver próximo, volta para o primeiro (Clara)
     if not next_persona:
         next_persona = PERSONAS_DATA[0]
     
@@ -129,7 +170,6 @@ def ensure_db_connection():
     """Garante que a conexão com o banco está ativa, reconectando se necessário."""
     global db_connection
     try:
-        # Testa a conexão com uma query simples
         with db_connection.cursor() as cur:
             cur.execute("SELECT 1")
             db_connection.commit()
@@ -149,9 +189,7 @@ def get_db_connection():
     try:
         conn = create_db_connection()
         
-        # Criar/Atualizar tabela para metadados de sessão
         with conn.cursor() as cur:
-            # Primeiro, cria a tabela se não existir
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS session_metadata (
                     thread_id TEXT PRIMARY KEY,
@@ -160,7 +198,6 @@ def get_db_connection():
                 )
             """)
             
-            # Adiciona a coluna last_accessed se não existir
             cur.execute("""
                 DO $$ 
                 BEGIN
@@ -174,7 +211,6 @@ def get_db_connection():
                 END $$;
             """)
             
-            # Adiciona a coluna user_id se não existir
             cur.execute("""
                 DO $$ 
                 BEGIN
@@ -188,7 +224,6 @@ def get_db_connection():
                 END $$;
             """)
             
-            # Cria índice para melhorar performance de queries por user_id
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_session_metadata_user_id 
                 ON session_metadata(user_id);
@@ -224,31 +259,67 @@ def get_app_and_checkpointer(_conn, _patient_llm, _evaluator_llm):
     _conn.autocommit = False
     
     def patient_node(state: AgentState) -> Dict:
+        """Nó que gera resposta do paciente."""
         system_prompt = SystemMessage(content=state["patient_prompt"])
         response = _patient_llm.invoke([system_prompt] + filter_messages(state["messages"]))
         return {"messages": [response]}
-
-    def evaluation_1_node(state: AgentState) -> Dict:
-        transcript = create_transcript(filter_messages(state["messages"]))
-        response = _evaluator_llm.invoke(EVALUATION_SESSION_1.format(transcript=transcript))
-        return {"messages": [AIMessage(content=response.content, response_metadata={EVALUATION_METADATA_KEY: True})], "current_session": 2, "session_1_end_index": len(state["messages"]) + 1}
-
-    def evaluation_2_node(state: AgentState) -> Dict:
-        transcript = create_transcript(filter_messages(state["messages"][state["session_1_end_index"]:]))
-        response = _evaluator_llm.invoke(EVALUATION_SESSION_2.format(transcript=transcript))
-        return {"messages": [AIMessage(content=response.content, response_metadata={EVALUATION_METADATA_KEY: True})], "current_session": 3}
-
+    
+    def create_evaluation_node(session_number: int):
+        """Cria um nó de avaliação para uma sessão específica."""
+        def evaluation_node(state: AgentState) -> Dict:
+            # Pega apenas as mensagens desta sessão
+            session_messages = get_session_messages(state, session_number)
+            transcript = create_transcript(filter_messages(session_messages))
+            
+            # Pega o prompt de avaliação correto
+            evaluation_prompt = EVALUATION_PROMPTS[session_number]
+            response = _evaluator_llm.invoke(evaluation_prompt.format(transcript=transcript))
+            
+            # Atualiza índices de fim de sessão
+            session_end_indices = state.get("session_end_indices", {}).copy()
+            session_end_indices[session_number] = len(state["messages"]) + 1
+            
+            return {
+                "messages": [AIMessage(content=response.content, response_metadata={EVALUATION_METADATA_KEY: True})],
+                "current_session": session_number + 1,
+                "session_end_indices": session_end_indices
+            }
+        
+        return evaluation_node
+    
+    # Criar workflow
     workflow = StateGraph(AgentState)
+    
+    # Adicionar nó do paciente
     workflow.add_node("patient_node", patient_node)
-    workflow.add_node("evaluation_1_node", evaluation_1_node)
-    workflow.add_node("evaluation_2_node", evaluation_2_node)
-    workflow.add_conditional_edges(START, route_entry_point, {"patient_node": "patient_node", "evaluate_session_1": "evaluation_1_node", "evaluate_session_2": "evaluation_2_node"})
+    
+    # Adicionar nós de avaliação (1-7)
+    for i in range(1, 8):
+        workflow.add_node(f"evaluation_{i}_node", create_evaluation_node(i))
+    
+    # Configurar edges condicionais do START
+    workflow.add_conditional_edges(
+        START,
+        route_entry_point,
+        {
+            "patient_node": "patient_node",
+            "evaluate_session_1": "evaluation_1_node",
+            "evaluate_session_2": "evaluation_2_node",
+            "evaluate_session_3": "evaluation_3_node",
+            "evaluate_session_4": "evaluation_4_node",
+            "evaluate_session_5": "evaluation_5_node",
+            "evaluate_session_6": "evaluation_6_node",
+            "evaluate_session_7": "evaluation_7_node"
+        }
+    )
+    
+    # Todos os nós vão para END
     workflow.add_edge("patient_node", END)
-    workflow.add_edge("evaluation_1_node", END)
-    workflow.add_edge("evaluation_2_node", END)
-
+    for i in range(1, 8):
+        workflow.add_edge(f"evaluation_{i}_node", END)
+    
     app = workflow.compile(checkpointer=checkpointer)
-    logger.info("✅ Aplicação LangGraph compilada e pronta para uso.")
+    logger.info("✅ Aplicação LangGraph compilada com 7 sessões.")
     return app, checkpointer
 
 # --- 6. INICIALIZAÇÃO DA APLICAÇÃO ---
@@ -267,23 +338,18 @@ def is_user_authorized(user_id: str) -> bool:
 
 def get_or_create_user_id():
     """Gera ou recupera um user_id único e valida contra a whitelist."""
-    
-    # Tenta recuperar da URL (para compartilhamento)
     url_user_id = st.query_params.get("user")
     
-    # Se existe na URL e não está no session_state, usa
     if url_user_id and "user_id" not in st.session_state:
         st.session_state.user_id = url_user_id
         logger.info(f"User ID recuperado da URL: {url_user_id}")
     
-    # Se não existe no session_state, cria novo
     if "user_id" not in st.session_state:
         new_user_id = secrets.token_urlsafe(16)
         st.session_state.user_id = new_user_id
         st.query_params.user = new_user_id
         logger.info(f"Novo User ID criado: {new_user_id}")
     
-    # Se existe no session_state mas não na URL, atualiza URL
     elif st.query_params.get("user") != st.session_state.user_id:
         st.query_params.user = st.session_state.user_id
     
@@ -291,30 +357,18 @@ def get_or_create_user_id():
 
 def show_unauthorized_page():
     """Exibe página de acesso negado para usuários não autorizados."""
-    st.set_page_config(page_title="Acesso Negado", page_icon="🚫")
-    
     st.error("# 🚫 Acesso Negado")
     st.markdown("""
     ### Você não tem permissão para acessar este aplicativo.
     
     Este é um sistema restrito para uso exclusivo de participantes autorizados do **Project Match**.
     
-    #### Por que vejo esta mensagem?
-    - Você não está na lista de usuários autorizados
-    - Seu link de acesso pode ter expirado
-    - Você pode estar usando um link de outra pessoa
-    
     #### Como obter acesso?
-    Se você acredita que deveria ter acesso a este sistema, entre em contato com o administrador do projeto.
-    
-    ---
-    
-    *Project Match - Simulador de Terapia*
+    Entre em contato com o administrador do projeto.
     """)
     
     with st.expander("ℹ️ Informações Técnicas"):
         st.code(f"User ID: {st.session_state.get('user_id', 'N/A')}")
-        st.caption("Compartilhe este ID com o administrador para solicitar acesso.")
     
     st.stop()
 
@@ -338,8 +392,8 @@ def update_session_access_time(thread_id: str):
         except:
             pass
 
-def get_recent_sessions(limit: int = 10):
-    """Retorna as sessões mais recentes DO USUÁRIO ATUAL, ordenadas pela data de criação."""
+def get_recent_sessions(limit: int = 50):
+    """Retorna as sessões mais recentes DO USUÁRIO ATUAL."""
     try:
         user_id = st.session_state.user_id
         conn = ensure_db_connection()
@@ -353,14 +407,14 @@ def get_recent_sessions(limit: int = 10):
                 LIMIT %s
             """, (user_id, limit))
             results = cur.fetchall()
-            conn.commit() 
+            conn.commit()
             return results
     except Exception as e:
         logger.error(f"Erro ao buscar sessões recentes: {e}")
         return []
 
 def save_session_metadata(thread_id: str, persona_name: str):
-    """Salva os metadados da sessão no banco de dados COM user_id."""
+    """Salva os metadados da sessão no banco de dados."""
     try:
         user_id = st.session_state.user_id
         conn = ensure_db_connection()
@@ -384,7 +438,7 @@ def save_session_metadata(thread_id: str, persona_name: str):
             pass
 
 def load_session_metadata(thread_id: str) -> str:
-    """Carrega o nome da persona do banco de dados SE pertencer ao usuário atual."""
+    """Carrega o nome da persona do banco de dados."""
     try:
         user_id = st.session_state.user_id
         conn = ensure_db_connection()
@@ -400,133 +454,108 @@ def load_session_metadata(thread_id: str) -> str:
             if result:
                 update_session_access_time(thread_id)
                 return result[0]
-            else:
-                logger.warning(f"Tentativa de acessar sessão de outro usuário: {thread_id}")
     except Exception as e:
         logger.error(f"Erro ao carregar metadados: {e}")
     return None
 
 def load_session_from_checkpoint(thread_id: str) -> bool:
-    """Tenta carregar uma sessão existente do checkpoint. Retorna True se bem-sucedido."""
+    """Tenta carregar uma sessão existente do checkpoint."""
     try:
         logger.info(f"Tentando carregar sessão existente: {thread_id}")
         
-        # Primeiro, tenta carregar os metadados da nossa tabela
         persona_name = load_session_metadata(thread_id)
         
         if not persona_name:
-            logger.info("Metadados da sessão não encontrados ou sessão pertence a outro usuário")
+            logger.info("Metadados da sessão não encontrados")
             return False
         
         persona_data = next((p for p in PERSONAS_DATA if p["name"] == persona_name), None)
         if not persona_data:
-            logger.warning(f"Persona {persona_name} não encontrada nos dados")
+            logger.warning(f"Persona {persona_name} não encontrada")
             return False
         
-        # Agora tenta carregar o estado do checkpoint
         config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
         saved_state = checkpointer.get(config)
         
-        # Inicializa com valores padrão
         messages = []
         current_session = 1
-        session_1_end_index = 0
+        session_end_indices = {}
         
-        # Se o checkpoint existir e tiver dados, usa eles
         if saved_state and saved_state.get("channel_values"):
             channel_values = saved_state["channel_values"]
             messages = channel_values.get("messages", [])
             current_session = channel_values.get("current_session", 1)
-            session_1_end_index = channel_values.get("session_1_end_index", 0)
+            session_end_indices = channel_values.get("session_end_indices", {})
         
-        # Restaura o estado no Streamlit
         st.session_state.messages = messages
         st.session_state.current_session_num = current_session
-        st.session_state.session_1_end_index = session_1_end_index
-        st.session_state.session_2_end_index = 0
+        st.session_state.session_end_indices = session_end_indices
         st.session_state.thread_id = thread_id
         st.session_state.current_patient = persona_data
         
-        logger.info(f"Sessão {thread_id} restaurada com a persona {persona_name} ({len(messages)} mensagens)")
+        logger.info(f"Sessão {thread_id} restaurada: {persona_name}, sessão {current_session}")
         if messages:
             st.toast(f"Sessão restaurada com {persona_name}!")
         return True
                     
     except Exception as e:
         logger.warning(f"Erro ao carregar sessão: {e}")
-        import traceback
-        logger.warning(traceback.format_exc())
     
     return False
 
 def initialize_session(thread_id: str = None, force_new: bool = False):
-    """Inicializa a sessão. Se um thread_id for fornecido, carrega o estado. Senão, cria uma nova sessão."""
+    """Inicializa a sessão."""
     
-    # Validar thread_id se fornecido
     if thread_id and not is_valid_uuid(thread_id):
-        logger.warning(f"Thread ID inválido fornecido: {thread_id}")
+        logger.warning(f"Thread ID inválido: {thread_id}")
         st.warning("⚠️ Link de sessão inválido. Criando nova sessão...")
         thread_id = None
     
-    # Se for forçar nova sessão, pula a tentativa de carregar
     if thread_id and not force_new:
         if load_session_from_checkpoint(thread_id):
             return
     
-    # Criar nova sessão - seleciona próximo paciente na ordem
     logger.info("Criando uma nova sessão.")
     new_thread_id = str(uuid.uuid4())
     
-    # Busca a última sessão do usuário para determinar o próximo paciente
     recent_sessions = get_recent_sessions(limit=1)
     
     if recent_sessions and len(recent_sessions) > 0:
-        last_persona_name = recent_sessions[0][1]  # Nome da persona da última sessão
+        last_persona_name = recent_sessions[0][1]
         new_patient = get_next_persona(last_persona_name)
-        logger.info(f"Última sessão foi com {last_persona_name}, próximo será {new_patient['name']}")
+        logger.info(f"Última sessão: {last_persona_name}, próximo: {new_patient['name']}")
     else:
-        # Se for a primeira sessão, começa com Clara
         new_patient = PERSONAS_DATA[0]
-        logger.info(f"Primeira sessão do usuário, começando com {new_patient['name']}")
+        logger.info(f"Primeira sessão, começando com {new_patient['name']}")
     
-    # Salvar metadados da sessão
     save_session_metadata(new_thread_id, new_patient['name'])
     
-    # Inicializar o estado da sessão no Streamlit
     st.session_state.messages = []
     st.session_state.thread_id = new_thread_id
     st.session_state.current_patient = new_patient
     st.session_state.current_session_num = 1
-    st.session_state.session_1_end_index = 0
-    st.session_state.session_2_end_index = 0
+    st.session_state.session_end_indices = {}
     
-    # Atualiza a query string
     st.query_params.thread_id = new_thread_id
-    logger.info(f"✅ Nova sessão inicializada: {new_thread_id} com a persona {new_patient['name']}")
+    logger.info(f"✅ Nova sessão: {new_thread_id} com {new_patient['name']}")
     st.toast(f"✅ Novo paciente: {new_patient['name']}!")
 
 # --- 8. VALIDAÇÃO DE ACESSO E INICIALIZAÇÃO ---
 
-# Validar whitelist ANTES de qualquer operação
 get_or_create_user_id()
 
 if not is_user_authorized(st.session_state.user_id):
     show_unauthorized_page()
 
-# Se chegou aqui, usuário está autorizado - continuar normalmente
 logger.info(f"✅ Usuário autorizado: {st.session_state.user_id}")
 
-# --- Lógica de Inicialização da Sessão ---
-# Verifica se há um thread_id diferente na URL
 url_thread_id = st.query_params.get("thread_id")
 current_thread_id = st.session_state.get("thread_id")
 
 if url_thread_id and url_thread_id != current_thread_id:
-    # URL mudou - carregar nova sessão
-    logger.info(f"Detectada mudança de thread_id: {current_thread_id} -> {url_thread_id}")
+    logger.info(f"Mudança de thread_id: {current_thread_id} -> {url_thread_id}")
     initialize_session(url_thread_id)
 elif "thread_id" not in st.session_state:
-    # Primeira inicialização
     initialize_session(url_thread_id)
 
 st.title("Simulador de Terapia (Project Match)")
@@ -537,15 +566,21 @@ with st.sidebar:
     components.html(CLOCK_HTML, height=65)
     
     st.header("Status da Simulação")
-    if st.session_state.current_session_num <= 2:
-        st.info(f"Sessão: **{st.session_state.current_session_num}** | Paciente: **{st.session_state.current_patient['name']}**", icon="⚠️")
+    if st.session_state.current_session_num <= 7:
+        progress = (st.session_state.current_session_num - 1) / 7
+        st.progress(progress)
+        st.info(
+            f"Sessão: **{st.session_state.current_session_num}/7** | "
+            f"Paciente: **{st.session_state.current_patient['name']}**", 
+            icon="⚠️"
+        )
     else:
-        st.success("Simulação Concluída!", icon="✅")
+        st.success("✅ Todas as 7 sessões concluídas!", icon="🎉")
     
     with st.expander("ℹ️ Informações de Acesso", expanded=False):
         st.caption(f"✅ Acesso Autorizado")
         st.caption(f"Thread ID: {st.session_state.thread_id}")
-        st.caption(f"📅 Sessão iniciada: {datetime.now(BRAZIL_TZ).strftime('%H:%M')}")
+        st.caption(f"📅 Iniciada: {datetime.now(BRAZIL_TZ).strftime('%H:%M')}")
         
     st.header("Suas Conversas")
     recent_sessions = get_recent_sessions(limit=50)
@@ -556,19 +591,17 @@ with st.sidebar:
         for thread_id, persona, created_at, last_accessed in recent_sessions:
             is_current = thread_id == current_tid
             
-            # Calcula o tempo desde último acesso
             now_utc = datetime.now(timezone.utc)
             last_accessed_utc = last_accessed if last_accessed.tzinfo else last_accessed.replace(tzinfo=timezone.utc)
             time_diff = now_utc - last_accessed_utc
             
             if time_diff.days > 0:
-                time_str = f"Último acesso {time_diff.days}d atrás"
+                time_str = f"{time_diff.days}d atrás"
             elif time_diff.seconds > 3600:
-                time_str = f"Último acesso {time_diff.seconds // 3600}h atrás"
+                time_str = f"{time_diff.seconds // 3600}h atrás"
             else:
-                time_str = f"Último acesso {time_diff.seconds // 60}min atrás"
+                time_str = f"{time_diff.seconds // 60}min atrás"
             
-            # Formata a data de criação
             created_at_local = created_at.astimezone(BRAZIL_TZ)
             date_str = created_at_local.strftime('%d/%m %H:%M')
             
@@ -581,18 +614,15 @@ with st.sidebar:
                 disabled=is_current,
                 help=time_str
             ):
-                # Limpa o estado atual antes de carregar nova sessão
-                for key in ['messages', 'current_session_num', 'session_1_end_index', 
-                        'session_2_end_index', 'thread_id', 'current_patient']:
+                for key in ['messages', 'current_session_num', 'session_end_indices', 
+                        'thread_id', 'current_patient']:
                     if key in st.session_state:
                         del st.session_state[key]
                 
-                # Atualiza URL e força carregamento
                 st.query_params.thread_id = thread_id
                 st.rerun()
     else:
         st.caption("Nenhuma conversa anterior")
-        st.caption("Inicie uma nova simulação!")
     
     st.header("Controles")
     col1, col2 = st.columns(2)
@@ -612,12 +642,19 @@ with st.sidebar:
                 elif isinstance(msg, HumanMessage) and END_SESSION_CODE not in msg.content:
                     output.append(f"Terapeuta: {msg.content}\n")
             return "".join(output)
+        
         if st.session_state.messages:
-            st.download_button("💾 Download", export_session_history(), f"sessao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", "text/plain", use_container_width=True)
+            st.download_button(
+                "💾 Download", 
+                export_session_history(), 
+                f"sessao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", 
+                "text/plain", 
+                use_container_width=True
+            )
         else:
             st.button("💾 Download", use_container_width=True, disabled=True)
     
-    if st.session_state.current_session_num <= 2:
+    if st.session_state.current_session_num <= 7:
         if st.button("🏁 Encerrar Sessão e Avaliar", type="primary", use_container_width=True):
             with st.spinner("⏳ Gerando avaliação detalhada..."):
                 try:
@@ -625,45 +662,57 @@ with st.sidebar:
                         {
                             "messages": st.session_state.messages + [HumanMessage(content=END_SESSION_CODE)], 
                             "current_session": st.session_state.current_session_num, 
-                            "session_1_end_index": st.session_state.session_1_end_index, 
+                            "session_end_indices": st.session_state.get("session_end_indices", {}),
                             "patient_prompt": st.session_state.current_patient['prompt'],
                             "persona_name": st.session_state.current_patient['name']
                         }, 
                         {"configurable": {"thread_id": st.session_state.thread_id}}
                     )
+                    
                     st.session_state.messages.append(response["messages"][-1])
+                    
                     if "current_session" in response:
                         new_session_num = response["current_session"]
-                        if new_session_num == 2:
-                            st.session_state.session_1_end_index = response.get("session_1_end_index", len(st.session_state.messages))
-                            st.session_state.current_session_num = new_session_num
-                            st.toast("✅ Sessão 1 avaliada! Iniciando Sessão 2...")
+                        st.session_state.current_session_num = new_session_num
+                        
+                        if "session_end_indices" in response:
+                            st.session_state.session_end_indices = response["session_end_indices"]
+                        
+                        if new_session_num <= 7:
+                            st.toast(f"✅ Sessão {new_session_num - 1} avaliada! Iniciando Sessão {new_session_num}...")
                         else:
-                            st.session_state.session_2_end_index = len(st.session_state.messages)
-                            st.session_state.current_session_num = new_session_num
-                            st.toast("✅ Simulação concluída!")
+                            st.toast("🎉 Todas as 7 sessões concluídas!")
+                    
                     st.rerun()
                 except Exception as e:
-                    logger.error(f"Error during evaluation: {e}")
-                    st.error(f"❌ Erro crítico ao processar a avaliação: {str(e)}")
+                    logger.error(f"Erro durante avaliação: {e}")
+                    st.error(f"❌ Erro ao processar avaliação: {str(e)}")
 
 # --- Lógica de renderização do Chat ---
+session_end_indices = st.session_state.get("session_end_indices", {})
+
 for i, msg in enumerate(st.session_state.messages):
     if isinstance(msg, AIMessage) and msg.response_metadata.get(EVALUATION_METADATA_KEY):
-        with st.chat_message("assistant", avatar="📋"): st.markdown("### 📊 Avaliação da Sessão\n" + msg.content)
+        with st.chat_message("assistant", avatar="📋"):
+            st.markdown("### 📊 Avaliação da Sessão\n" + msg.content)
     elif isinstance(msg, AIMessage):
         st.chat_message("assistant", avatar="🧑‍⚕️").write(msg.content)
     elif isinstance(msg, HumanMessage) and END_SESSION_CODE not in msg.content:
         st.chat_message("user", avatar="👨‍💻").write(msg.content)
-
-    if st.session_state.session_1_end_index > 0 and i == st.session_state.session_1_end_index - 1:
-        st.divider(); st.subheader("🔄 Sessão 2"); st.divider()
-    if st.session_state.session_2_end_index > 0 and i == st.session_state.session_2_end_index - 1:
-        st.divider(); st.subheader("✅ Fim da Simulação"); st.divider()
-        st.info("💡 Use o botão 'Download' para salvar o histórico ou 'Novo Paciente' para continuar.", icon="ℹ️")
+    
+    # Mostrar divisores entre sessões
+    for session_num in range(1, 8):
+        if session_num in session_end_indices and i == session_end_indices[session_num] - 1:
+            st.divider()
+            if session_num < 7:
+                st.subheader(f"🔄 Sessão {session_num + 1}")
+            else:
+                st.subheader("✅ Fim da Simulação")
+                st.info("💡 Use 'Download' para salvar ou 'Novo Paciente' para continuar.", icon="ℹ️")
+            st.divider()
 
 # --- Input do Chat e Geração de Resposta ---
-if prompt := st.chat_input("Digite sua mensagem...", disabled=(st.session_state.current_session_num > 2)):
+if prompt := st.chat_input("Digite sua mensagem...", disabled=(st.session_state.current_session_num > 7)):
     if not prompt.strip():
         st.warning("⚠️ Por favor, digite uma mensagem válida.")
     else:
@@ -678,7 +727,7 @@ if st.session_state.messages and isinstance(st.session_state.messages[-1], Human
                     {
                         "messages": st.session_state.messages, 
                         "current_session": st.session_state.current_session_num, 
-                        "session_1_end_index": st.session_state.session_1_end_index, 
+                        "session_end_indices": st.session_state.get("session_end_indices", {}),
                         "patient_prompt": st.session_state.current_patient['prompt'],
                         "persona_name": st.session_state.current_patient['name']
                     },
@@ -688,6 +737,5 @@ if st.session_state.messages and isinstance(st.session_state.messages[-1], Human
                 st.session_state.messages.append(ai_response)
                 st.rerun()
             except Exception as e:
-                logger.error(f"Error generating patient response: {e}")
+                logger.error(f"Erro ao gerar resposta: {e}")
                 st.error(f"❌ Erro ao gerar resposta: {str(e)}")
-
