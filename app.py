@@ -201,18 +201,44 @@ def setup_database():
     logger.info("Configurando tabelas no Supabase...")
     
     queries = [
+        # Criar tabela base
         """
         CREATE TABLE IF NOT EXISTS session_metadata (
             thread_id TEXT PRIMARY KEY,
             persona_name TEXT NOT NULL,
             user_id TEXT NOT NULL DEFAULT 'legacy',
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-            last_accessed TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-            session_count INTEGER DEFAULT 0,
-            total_messages INTEGER DEFAULT 0
+            last_accessed TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
         """,
         
+        # Adicionar coluna session_count se não existir
+        """
+        DO $$ 
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name='session_metadata' AND column_name='session_count'
+            ) THEN
+                ALTER TABLE session_metadata ADD COLUMN session_count INTEGER DEFAULT 0;
+            END IF;
+        END $$;
+        """,
+        
+        # Adicionar coluna total_messages se não existir
+        """
+        DO $$ 
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name='session_metadata' AND column_name='total_messages'
+            ) THEN
+                ALTER TABLE session_metadata ADD COLUMN total_messages INTEGER DEFAULT 0;
+            END IF;
+        END $$;
+        """,
+        
+        # Índices
         """
         CREATE INDEX IF NOT EXISTS idx_user_sessions 
         ON session_metadata(user_id, created_at DESC)
@@ -223,6 +249,7 @@ def setup_database():
         ON session_metadata(last_accessed)
         """,
         
+        # Tabela de métricas
         """
         CREATE TABLE IF NOT EXISTS session_metrics (
             id SERIAL PRIMARY KEY,
