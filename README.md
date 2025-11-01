@@ -167,19 +167,6 @@ O sistema simula pacientes com diferentes níveis de gravidade segundo o AUDIT (
 - **16-19 pontos**: Uso nocivo (Clara - 19)
 - **20-40 pontos**: Possível dependência (Rafael - 22)
 
-## Contribuição
-
-Contribuições são bem-vindas! Por favor:
-1. Faça fork do projeto
-2. Crie uma branch para sua feature (`git checkout -b feature/nova-feature`)
-3. Commit suas mudanças (`git commit -m 'Adiciona nova feature'`)
-4. Push para a branch (`git push origin feature/nova-feature`)
-5. Abra um Pull Request
-
-## Suporte
-
-Para questões ou suporte, abra uma issue no repositório.
-
 ## Referências
 
 - **Project MATCH Research Group** - Manual de Terapia Cognitivo-Comportamental
@@ -188,7 +175,3 @@ Para questões ou suporte, abra uma issue no repositório.
 ## Licença
 
 Este projeto é desenvolvido para fins educacionais e de treinamento profissional em psicologia clínica.
-
----
-
-**Desenvolvido com foco em treinamento clínico baseado em evidências**
