@@ -612,13 +612,13 @@ with st.sidebar:
     
     st.header("Status da Simulação")
     if st.session_state.current_session_num <= 7:
-        progress = (st.session_state.current_session_num - 1) / 7
-        st.progress(progress)
         st.info(
             f"Sessão: **{st.session_state.current_session_num}/7** | "
             f"Paciente: **{st.session_state.current_patient['name']}**", 
             icon="⚠️"
         )
+        progress = (st.session_state.current_session_num - 1) / 7
+        st.progress(progress)
     else:
         st.success("✅ Todas as 7 sessões concluídas!", icon="🎉")
     
@@ -796,3 +796,4 @@ if st.session_state.messages and isinstance(st.session_state.messages[-1], Human
             except Exception as e:
                 logger.error(f"Erro ao gerar resposta: {e}")
                 st.error(f"❌ Erro ao gerar resposta: {str(e)}")
+
