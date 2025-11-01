@@ -9,7 +9,6 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_core.tracers.context import tracing_v2_enabled
 from langgraph.graph import StateGraph, add_messages, END, START
 from langgraph.checkpoint.postgres import PostgresSaver
 import psycopg
@@ -36,7 +35,6 @@ load_dotenv()
 # --- 2. CONSTANTES E VALIDAÇÕES INICIAIS ---
 END_SESSION_CODE = "H7Y4K9P2R1T6X3Z0V8B5N7M3G"
 EVALUATION_METADATA_KEY = "is_evaluation"
-MIN_PROMPT_LENGTH = 10
 BRAZIL_TZ = timezone(timedelta(hours=-3))
 CLOCK_HTML = """<style> .digital-clock { background-color: #e1e5eb; border: 2px solid #c9ced4; border-radius: 5px; padding: 8px; font-family: sans-serif; color: #0d1a33; font-size: 1.75rem; font-weight: bold; text-align: center; letter-spacing: 2px; } </style><script> function updateClock() { var now = new Date(); var h = now.getHours().toString().padStart(2, '0'); var m = now.getMinutes().toString().padStart(2, '0'); var s = now.getSeconds().toString().padStart(2, '0'); document.getElementById('clock').innerText = h + ':' + m + ':' + s; } setInterval(updateClock, 1000); setTimeout(updateClock, 1); </script><div id="clock" class="digital-clock"></div>"""
 
@@ -58,14 +56,12 @@ if not api_key or not model:
     st.stop()
 
 # --- 3. ESTRUTURAS DE DADOS E DEFINIÇÕES GLOBAIS ---
-# ORDEM FIXA: Clara → Rafael → Luiz
 PERSONAS_DATA = [
     {"name": "Clara", "prompt": PERSONA_CLARA, "order": 1},
     {"name": "Rafael", "prompt": PERSONA_RAFAEL, "order": 2},
     {"name": "Luiz", "prompt": PERSONA_LUIZ, "order": 3},
 ]
 
-# Mapeia número de sessão para prompt de avaliação
 EVALUATION_PROMPTS = {
     1: EVALUATION_SESSION_1,
     2: EVALUATION_SESSION_2,
@@ -85,7 +81,6 @@ class AgentState(TypedDict):
 
 # --- 4. FUNÇÕES HELPER GLOBAIS ---
 def is_valid_uuid(val: str) -> bool:
-    """Valida se uma string é um UUID válido."""
     try:
         uuid.UUID(str(val))
         return True
@@ -93,15 +88,12 @@ def is_valid_uuid(val: str) -> bool:
         return False
 
 def filter_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
-    """Remove mensagens de controle e avaliações."""
     return [msg for msg in messages if not (isinstance(msg, HumanMessage) and END_SESSION_CODE in msg.content) and not (isinstance(msg, AIMessage) and msg.response_metadata.get(EVALUATION_METADATA_KEY))]
 
 def create_transcript(messages: List[BaseMessage]) -> str:
-    """Cria transcrição formatada das mensagens."""
     return "\n".join([f"{'Terapeuta' if isinstance(msg, HumanMessage) else 'Paciente'}: {msg.content}" for msg in messages])
 
 def get_session_messages(state: AgentState, session_number: int) -> List[BaseMessage]:
-    """Extrai apenas as mensagens de uma sessão específica."""
     session_end_indices = state.get("session_end_indices", {})
     all_messages = state["messages"]
     
@@ -111,11 +103,9 @@ def get_session_messages(state: AgentState, session_number: int) -> List[BaseMes
         start_idx = session_end_indices.get(session_number - 1, 0)
     
     end_idx = len(all_messages)
-    
     return all_messages[start_idx:end_idx]
 
 def route_entry_point(state: AgentState) -> str:
-    """Roteia para o nó correto baseado no estado."""
     last_message = state["messages"][-1] if state["messages"] else None
     
     if isinstance(last_message, HumanMessage) and END_SESSION_CODE in last_message.content:
@@ -139,7 +129,6 @@ def route_entry_point(state: AgentState) -> str:
     return "patient_node"
 
 def get_next_persona(current_persona_name: str) -> Dict:
-    """Retorna o próximo paciente na ordem fixa: Clara → Rafael → Luiz → Clara..."""
     current_persona = next((p for p in PERSONAS_DATA if p["name"] == current_persona_name), None)
     
     if not current_persona:
@@ -153,92 +142,42 @@ def get_next_persona(current_persona_name: str) -> Dict:
     
     return next_persona
 
-# --- 5. POOL DE CONEXÕES SUPABASE ---
+# --- 5. CONEXÃO SUPABASE (IPv4 Pooler) ---
 
-class SupabaseConnectionPool:
-    """Pool de conexões otimizado para Supabase."""
-    
-    def __init__(self, min_size: int = 2, max_size: int = 10):
-        self.connection_string = self._build_connection_string()
-        self.min_size = min_size
-        self.max_size = max_size
-        self._pool = None
-        
-    def _build_connection_string(self) -> str:
-        """Constrói string de conexão otimizada para Supabase."""
-        return (
-            f"host={os.getenv('POSTGRES_HOST')} "
-            f"port={os.getenv('POSTGRES_PORT')} "
-            f"dbname={os.getenv('POSTGRES_DB')} "
-            f"user={os.getenv('POSTGRES_USER')} "
-            f"password={os.getenv('POSTGRES_PASSWORD')} "
-            f"sslmode=require "
-            f"connect_timeout=10 "
-            f"keepalives=1 "
-            f"keepalives_idle=30 "
-            f"keepalives_interval=10 "
-            f"keepalives_count=5 "
-            f"application_name=project-match-simulator"
-        )
-    
-    def get_connection(self):
-        """Obtém conexão do pool."""
-        try:
-            if self._pool is None:
-                logger.info("Criando pool de conexões Supabase...")
-                from psycopg_pool import ConnectionPool
-                self._pool = ConnectionPool(
-                    self.connection_string,
-                    min_size=self.min_size,
-                    max_size=self.max_size,
-                    timeout=30,
-                    max_waiting=20
-                )
-                logger.info(f"✅ Pool criado: {self.min_size}-{self.max_size} conexões")
-            
-            return self._pool.connection()
-        except ImportError:
-            # Fallback se psycopg_pool não estiver disponível
-            logger.warning("psycopg_pool não disponível, usando conexão simples")
-            return psycopg.connect(self.connection_string)
-        except Exception as e:
-            logger.error(f"Erro ao obter conexão do pool: {e}")
-            # Fallback para conexão direta
-            return psycopg.connect(self.connection_string)
-
-# --- 6. FUNÇÕES DE BANCO DE DADOS OTIMIZADAS ---
-
-@st.cache_resource
-def get_connection_pool():
-    """Inicializa pool de conexões (cached)."""
-    return SupabaseConnectionPool(min_size=2, max_size=10)
+def create_supabase_connection():
+    """Cria conexão otimizada com Supabase usando IPv4 pooler."""
+    return psycopg.connect(
+        user=os.getenv("POSTGRES_USER"),
+        password=os.getenv("POSTGRES_PASSWORD"),
+        host=os.getenv("POSTGRES_HOST"),
+        port=os.getenv("POSTGRES_PORT"),
+        dbname=os.getenv("POSTGRES_DB"),
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5
+    )
 
 def execute_db_query(query: str, params: tuple = None, fetch: bool = False):
-    """
-    Executa query no Supabase com retry automático e logging.
-    
-    Args:
-        query: SQL query
-        params: Parâmetros da query
-        fetch: Se True, retorna resultados (SELECT)
-    """
-    pool = get_connection_pool()
+    """Executa query com retry automático."""
     max_retries = 3
     retry_delay = 1
     
     for attempt in range(max_retries):
+        conn = None
         try:
-            with pool.get_connection() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(query, params or ())
-                    
-                    if fetch:
-                        results = cur.fetchall()
-                        conn.commit()
-                        return results
-                    else:
-                        conn.commit()
-                        return None
+            conn = create_supabase_connection()
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(query, params or ())
+                
+                if fetch:
+                    results = cur.fetchall()
+                    conn.commit()
+                    return results
+                else:
+                    conn.commit()
+                    return None
         
         except Exception as e:
             logger.warning(f"Tentativa {attempt + 1}/{max_retries} falhou: {e}")
@@ -246,17 +185,22 @@ def execute_db_query(query: str, params: tuple = None, fetch: bool = False):
             if attempt < max_retries - 1:
                 import time
                 time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+                retry_delay *= 2
             else:
                 logger.error(f"Erro após {max_retries} tentativas: {e}")
                 raise
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
 
 def setup_database():
-    """Configura tabelas e índices otimizados para Supabase."""
+    """Configura tabelas no Supabase."""
     logger.info("Configurando tabelas no Supabase...")
     
     queries = [
-        # Tabela principal com índices otimizados
         """
         CREATE TABLE IF NOT EXISTS session_metadata (
             thread_id TEXT PRIMARY KEY,
@@ -269,33 +213,26 @@ def setup_database():
         )
         """,
         
-        # Índice composto para queries do usuário
         """
         CREATE INDEX IF NOT EXISTS idx_user_sessions 
         ON session_metadata(user_id, created_at DESC)
         """,
         
-        # Índice para cleanup de sessões antigas
         """
         CREATE INDEX IF NOT EXISTS idx_last_accessed 
         ON session_metadata(last_accessed)
-        WHERE last_accessed < CURRENT_TIMESTAMP - INTERVAL '90 days'
         """,
         
-        # Tabela de métricas (novo)
         """
         CREATE TABLE IF NOT EXISTS session_metrics (
             id SERIAL PRIMARY KEY,
             thread_id TEXT REFERENCES session_metadata(thread_id) ON DELETE CASCADE,
             session_number INTEGER NOT NULL,
-            evaluation_score JSONB,
             message_count INTEGER,
-            duration_seconds INTEGER,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
         """,
         
-        # Índice para métricas
         """
         CREATE INDEX IF NOT EXISTS idx_metrics_thread 
         ON session_metrics(thread_id, session_number)
@@ -310,40 +247,26 @@ def setup_database():
     
     logger.info("✅ Database configurado com sucesso")
 
-# --- 7. FUNÇÕES CACHEADAS PARA RECURSOS CAROS ---
+# --- 6. FUNÇÕES CACHEADAS ---
 
 @st.cache_resource
 def get_llms():
-    """Inicializa LLMs com configuração otimizada."""
     logger.info("Criando instâncias dos LLMs...")
     try:
-        # LLM do paciente com streaming
         patient_llm = ChatOpenAI(
             model=model,
             openai_api_key=api_key,
             temperature=0,
             max_retries=3,
-            timeout=30,
-            streaming=False,  # Desabilitado para Streamlit
-            model_kwargs={
-                "top_p": 0.95,
-                "frequency_penalty": 0.3,
-                "presence_penalty": 0.3
-            }
+            timeout=30
         )
         
-        # LLM avaliador com timeout maior
         evaluator_llm = ChatOpenAI(
             model=model,
             openai_api_key=api_key,
             temperature=0,
             max_retries=3,
-            timeout=90,
-            model_kwargs={
-                "top_p": 1.0,
-                "frequency_penalty": 0,
-                "presence_penalty": 0
-            }
+            timeout=90
         )
         
         logger.info("✅ LLMs inicializados com sucesso")
@@ -354,13 +277,10 @@ def get_llms():
 
 @st.cache_resource
 def get_app_and_checkpointer(_patient_llm, _evaluator_llm):
-    """Compila grafo LangGraph com observabilidade LangSmith."""
     logger.info("Compilando grafo LangGraph...")
     
-    # Pool de conexões para checkpointer
-    pool = get_connection_pool()
-    conn = pool.get_connection()
-    
+    # Conexão dedicada para checkpointer
+    conn = create_supabase_connection()
     checkpointer = PostgresSaver(conn=conn)
     
     conn.autocommit = True
@@ -368,96 +288,39 @@ def get_app_and_checkpointer(_patient_llm, _evaluator_llm):
     conn.autocommit = False
     
     def patient_node(state: AgentState) -> Dict:
-        """Nó que gera resposta do paciente com tracking LangSmith."""
-        try:
-            # Metadata para LangSmith
-            metadata = {
-                "session_number": state.get("current_session", 1),
-                "persona": state.get("persona_name", "unknown"),
-                "message_count": len(state.get("messages", [])),
-                "node_type": "patient_response"
-            }
-            
-            # Tags para filtrar no LangSmith
-            tags = [
-                f"session-{state.get('current_session', 1)}",
-                f"persona-{state.get('persona_name', 'unknown')}",
-                "patient-node"
-            ]
-            
-            with tracing_v2_enabled(
-                project_name=LANGSMITH_PROJECT,
-                tags=tags,
-                metadata=metadata
-            ):
-                system_prompt = SystemMessage(content=state["patient_prompt"])
-                response = _patient_llm.invoke([system_prompt] + filter_messages(state["messages"]))
-            
-            return {"messages": [response]}
-        
-        except Exception as e:
-            logger.error(f"Erro no patient_node: {e}")
-            raise
+        system_prompt = SystemMessage(content=state["patient_prompt"])
+        response = _patient_llm.invoke([system_prompt] + filter_messages(state["messages"]))
+        return {"messages": [response]}
     
     def create_evaluation_node(session_number: int):
-        """Cria nó de avaliação com tracking detalhado."""
         def evaluation_node(state: AgentState) -> Dict:
-            try:
-                # Metadata rica para LangSmith
-                session_messages = get_session_messages(state, session_number)
-                filtered = filter_messages(session_messages)
-                
-                metadata = {
-                    "session_number": session_number,
-                    "persona": state.get("persona_name", "unknown"),
-                    "messages_evaluated": len(filtered),
-                    "total_messages": len(state.get("messages", [])),
-                    "node_type": "evaluation",
-                    "evaluation_type": f"session_{session_number}"
-                }
-                
-                tags = [
-                    f"evaluation-session-{session_number}",
-                    f"persona-{state.get('persona_name', 'unknown')}",
-                    "evaluation-node"
-                ]
-                
-                with tracing_v2_enabled(
-                    project_name=LANGSMITH_PROJECT,
-                    tags=tags,
-                    metadata=metadata
-                ):
-                    transcript = create_transcript(filtered)
-                    evaluation_prompt = EVALUATION_PROMPTS[session_number]
-                    response = _evaluator_llm.invoke(evaluation_prompt.format(transcript=transcript))
-                
-                # Salvar métricas
-                try:
-                    save_session_metrics(
-                        state.get("thread_id", "unknown"),
-                        session_number,
-                        len(filtered)
-                    )
-                except Exception as e:
-                    logger.warning(f"Erro ao salvar métricas: {e}")
-                
-                # Atualizar índices
-                session_end_indices = state.get("session_end_indices", {}).copy()
-                session_end_indices[session_number] = len(state["messages"]) + 1
-                
-                return {
-                    "messages": [AIMessage(content=response.content, response_metadata={EVALUATION_METADATA_KEY: True})],
-                    "current_session": session_number + 1,
-                    "session_end_indices": session_end_indices
-                }
+            session_messages = get_session_messages(state, session_number)
+            transcript = create_transcript(filter_messages(session_messages))
             
+            evaluation_prompt = EVALUATION_PROMPTS[session_number]
+            response = _evaluator_llm.invoke(evaluation_prompt.format(transcript=transcript))
+            
+            # Salvar métricas
+            try:
+                save_session_metrics(
+                    state.get("thread_id", "unknown"),
+                    session_number,
+                    len(filter_messages(session_messages))
+                )
             except Exception as e:
-                logger.error(f"Erro no evaluation_node (sessão {session_number}): {e}")
-                raise
+                logger.warning(f"Erro ao salvar métricas: {e}")
+            
+            session_end_indices = state.get("session_end_indices", {}).copy()
+            session_end_indices[session_number] = len(state["messages"]) + 1
+            
+            return {
+                "messages": [AIMessage(content=response.content, response_metadata={EVALUATION_METADATA_KEY: True})],
+                "current_session": session_number + 1,
+                "session_end_indices": session_end_indices
+            }
         
         return evaluation_node
     
-    # Criar workflow
     workflow = StateGraph(AgentState)
     workflow.add_node("patient_node", patient_node)
     
@@ -484,13 +347,12 @@ def get_app_and_checkpointer(_patient_llm, _evaluator_llm):
         workflow.add_edge(f"evaluation_{i}_node", END)
     
     app = workflow.compile(checkpointer=checkpointer)
-    logger.info("✅ Aplicação LangGraph compilada com 7 sessões e observabilidade LangSmith")
+    logger.info("✅ Aplicação LangGraph compilada com 7 sessões")
     return app, checkpointer
 
-# --- 8. FUNÇÕES DE MÉTRICAS ---
+# --- 7. FUNÇÕES DE MÉTRICAS ---
 
 def save_session_metrics(thread_id: str, session_number: int, message_count: int):
-    """Salva métricas da sessão no Supabase."""
     query = """
         INSERT INTO session_metrics (thread_id, session_number, message_count)
         VALUES (%s, %s, %s)
@@ -502,7 +364,6 @@ def save_session_metrics(thread_id: str, session_number: int, message_count: int
         logger.warning(f"Erro ao salvar métricas: {e}")
 
 def update_session_stats(thread_id: str, session_num: int, total_msgs: int):
-    """Atualiza estatísticas da sessão."""
     query = """
         UPDATE session_metadata 
         SET session_count = %s, 
@@ -515,22 +376,20 @@ def update_session_stats(thread_id: str, session_num: int, total_msgs: int):
     except Exception as e:
         logger.warning(f"Erro ao atualizar stats: {e}")
 
-# --- 9. INICIALIZAÇÃO ---
+# --- 8. INICIALIZAÇÃO ---
 setup_database()
 patient_llm, evaluator_llm = get_llms()
 app, checkpointer = get_app_and_checkpointer(patient_llm, evaluator_llm)
 
-# --- 10. GERENCIAMENTO DE USER_ID ---
+# --- 9. GERENCIAMENTO DE USER_ID ---
 
 def is_user_authorized(user_id: str) -> bool:
-    """Verifica se o user_id está na whitelist."""
     is_authorized = user_id in ALLOWED_USER_IDS
     if not is_authorized:
         logger.warning(f"🚫 Tentativa de acesso não autorizado: {user_id}")
     return is_authorized
 
 def get_or_create_user_id():
-    """Gera ou recupera um user_id único."""
     url_user_id = st.query_params.get("user")
     
     if url_user_id and "user_id" not in st.session_state:
@@ -549,7 +408,6 @@ def get_or_create_user_id():
     return st.session_state.user_id
 
 def show_unauthorized_page():
-    """Exibe página de acesso negado."""
     st.error("# 🚫 Acesso Negado")
     st.markdown("""
     ### Você não tem permissão para acessar este aplicativo.
@@ -565,10 +423,9 @@ def show_unauthorized_page():
     
     st.stop()
 
-# --- 11. FUNÇÕES DE SESSÃO OTIMIZADAS ---
+# --- 10. FUNÇÕES DE SESSÃO ---
 
 def get_recent_sessions(limit: int = 50) -> List[Dict]:
-    """Retorna sessões recentes com dados completos."""
     query = """
         SELECT 
             thread_id, 
@@ -591,7 +448,6 @@ def get_recent_sessions(limit: int = 50) -> List[Dict]:
         return []
 
 def save_session_metadata(thread_id: str, persona_name: str):
-    """Salva metadados da sessão."""
     query = """
         INSERT INTO session_metadata (thread_id, persona_name, user_id, last_accessed)
         VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
@@ -608,7 +464,6 @@ def save_session_metadata(thread_id: str, persona_name: str):
         logger.error(f"Erro ao salvar metadados: {e}")
 
 def load_session_metadata(thread_id: str) -> Optional[str]:
-    """Carrega nome da persona."""
     query = """
         SELECT persona_name 
         FROM session_metadata 
@@ -619,7 +474,6 @@ def load_session_metadata(thread_id: str) -> Optional[str]:
         results = execute_db_query(query, (thread_id, user_id), fetch=True)
         
         if results and len(results) > 0:
-            # Atualizar last_accessed
             update_query = "UPDATE session_metadata SET last_accessed = CURRENT_TIMESTAMP WHERE thread_id = %s"
             execute_db_query(update_query, (thread_id,))
             return results[0]['persona_name']
@@ -629,7 +483,6 @@ def load_session_metadata(thread_id: str) -> Optional[str]:
     return None
 
 def load_session_from_checkpoint(thread_id: str) -> bool:
-    """Carrega sessão existente."""
     try:
         logger.info(f"Carregando sessão: {thread_id}")
         
@@ -671,8 +524,6 @@ def load_session_from_checkpoint(thread_id: str) -> bool:
     return False
 
 def initialize_session(thread_id: str = None, force_new: bool = False):
-    """Inicializa sessão."""
-    
     if thread_id and not is_valid_uuid(thread_id):
         logger.warning(f"Thread ID inválido: {thread_id}")
         st.warning("⚠️ Link inválido. Criando nova sessão...")
@@ -707,7 +558,7 @@ def initialize_session(thread_id: str = None, force_new: bool = False):
     logger.info(f"✅ Nova sessão: {new_thread_id}")
     st.toast(f"✅ Novo paciente: {new_patient['name']}!")
 
-# --- 12. VALIDAÇÃO E INICIALIZAÇÃO ---
+# --- 11. VALIDAÇÃO E INICIALIZAÇÃO ---
 
 get_or_create_user_id()
 
@@ -726,8 +577,7 @@ elif "thread_id" not in st.session_state:
 
 st.title("Simulador de Terapia (Project Match)")
 
-# --- 13. INTERFACE (SIDEBAR E CHAT) ---
-# [Código da interface permanece igual ao anterior, mas com get_recent_sessions retornando dicts]
+# --- 12. INTERFACE ---
 
 with st.sidebar:
     st.title("Painel de Controle")
@@ -744,12 +594,6 @@ with st.sidebar:
         )
     else:
         st.success("✅ Todas as 7 sessões concluídas!", icon="🎉")
-    
-    # Link para LangSmith se disponível
-    if LANGSMITH_API_KEY:
-        with st.expander("🔍 Observabilidade LangSmith"):
-            st.markdown(f"[Ver traces no LangSmith]({LANGSMITH_ENDPOINT}/o/default/projects/p/{LANGSMITH_PROJECT})")
-            st.caption(f"Projeto: {LANGSMITH_PROJECT}")
     
     with st.expander("ℹ️ Informações de Acesso", expanded=False):
         st.caption(f"✅ Acesso Autorizado")
@@ -837,9 +681,6 @@ with st.sidebar:
         if st.button("🏁 Encerrar Sessão e Avaliar", type="primary", use_container_width=True):
             with st.spinner("⏳ Gerando avaliação detalhada..."):
                 try:
-                    # Metadados para LangSmith
-                    run_name = f"Evaluation-Session-{st.session_state.current_session_num}"
-                    
                     response = app.invoke(
                         {
                             "messages": st.session_state.messages + [HumanMessage(content=END_SESSION_CODE)], 
@@ -848,8 +689,7 @@ with st.sidebar:
                             "patient_prompt": st.session_state.current_patient['prompt'],
                             "persona_name": st.session_state.current_patient['name']
                         }, 
-                        {"configurable": {"thread_id": st.session_state.thread_id}},
-                        {"run_name": run_name}  # Nome da run no LangSmith
+                        {"configurable": {"thread_id": st.session_state.thread_id}}
                     )
                     
                     st.session_state.messages.append(response["messages"][-1])
@@ -861,7 +701,6 @@ with st.sidebar:
                         if "session_end_indices" in response:
                             st.session_state.session_end_indices = response["session_end_indices"]
                         
-                        # Atualizar estatísticas
                         update_session_stats(
                             st.session_state.thread_id,
                             new_session_num - 1,
@@ -878,7 +717,8 @@ with st.sidebar:
                     logger.error(f"Erro durante avaliação: {e}")
                     st.error(f"❌ Erro ao processar avaliação: {str(e)}")
 
-# --- Renderização e Input do Chat ---
+# --- 13. RENDERIZAÇÃO DO CHAT ---
+
 session_end_indices = st.session_state.get("session_end_indices", {})
 
 for i, msg in enumerate(st.session_state.messages):
@@ -900,6 +740,8 @@ for i, msg in enumerate(st.session_state.messages):
                 st.info("💡 Use 'Download' para salvar ou 'Novo Paciente' para continuar.", icon="ℹ️")
             st.divider()
 
+# --- 14. INPUT DO CHAT ---
+
 if prompt := st.chat_input("Digite sua mensagem...", disabled=(st.session_state.current_session_num > 7)):
     if not prompt.strip():
         st.warning("⚠️ Por favor, digite uma mensagem válida.")
@@ -911,9 +753,6 @@ if st.session_state.messages and isinstance(st.session_state.messages[-1], Human
     with st.chat_message("assistant", avatar="🧑‍⚕️"):
         with st.spinner("💭 Paciente Digitando..."):
             try:
-                # Nome da run para LangSmith
-                run_name = f"Patient-Response-Session-{st.session_state.current_session_num}"
-                
                 response = app.invoke(
                     {
                         "messages": st.session_state.messages, 
@@ -922,8 +761,7 @@ if st.session_state.messages and isinstance(st.session_state.messages[-1], Human
                         "patient_prompt": st.session_state.current_patient['prompt'],
                         "persona_name": st.session_state.current_patient['name']
                     },
-                    {"configurable": {"thread_id": st.session_state.thread_id}},
-                    {"run_name": run_name}
+                    {"configurable": {"thread_id": st.session_state.thread_id}}
                 )
                 ai_response = response["messages"][-1]
                 st.session_state.messages.append(ai_response)
