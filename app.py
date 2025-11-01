@@ -591,7 +591,21 @@ with st.sidebar:
         for thread_id, persona, created_at, last_accessed in recent_sessions:
             is_current = thread_id == current_tid
             
-            button_label = f"{'🟢' if is_current else '⚪'} {persona}"
+            now_utc = datetime.now(timezone.utc)
+            last_accessed_utc = last_accessed if last_accessed.tzinfo else last_accessed.replace(tzinfo=timezone.utc)
+            time_diff = now_utc - last_accessed_utc
+            
+            if time_diff.days > 0:
+                time_str = f"{time_diff.days}d atrás"
+            elif time_diff.seconds > 3600:
+                time_str = f"{time_diff.seconds // 3600}h atrás"
+            else:
+                time_str = f"{time_diff.seconds // 60}min atrás"
+            
+            created_at_local = created_at.astimezone(BRAZIL_TZ)
+            date_str = created_at_local.strftime('%d/%m %H:%M')
+            
+            button_label = f"{'🟢' if is_current else '⚪'} {persona} - {date_str}"
 
             if st.button(
                 button_label,
@@ -725,4 +739,5 @@ if st.session_state.messages and isinstance(st.session_state.messages[-1], Human
             except Exception as e:
                 logger.error(f"Erro ao gerar resposta: {e}")
                 st.error(f"❌ Erro ao gerar resposta: {str(e)}")
+
 
